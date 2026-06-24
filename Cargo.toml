@@ -1,0 +1,15 @@
+[package]
+name = "bjorst-telemetry"
+version = "0.1.0"
+edition = "2021"
+authors = ["Bjorst Engineering <engineering@bjorst.com>"]
+license = "MIT"
+description = "Tracing + OTLP telemetry bootstrap for Bjorst axum services (generic endpoint/headers, Axiom-compatible)"
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-client", "reqwest-rustls"] }
