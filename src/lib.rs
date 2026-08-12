@@ -5,6 +5,10 @@
 //! - a stdout fmt layer ([`LogFormat`] — JSON, compact, or the default),
 //! - and, when [`TelemetryConfig::otlp`] is set, a batched OTLP span exporter.
 //!
+//! [`init_with`] takes additional layers, each carrying its own filter. See its
+//! documentation for why the caller's `env_filter` cannot be allowed to reach
+//! them.
+//!
 //! The crate is intentionally backend-agnostic. Axiom is just an OTLP endpoint
 //! plus two headers, so callers that target Axiom pass the endpoint and headers
 //! in [`OtlpConfig`]; no vendor logic lives here.
@@ -33,7 +37,17 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{trace::TracerProvider, Resource};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{
+    fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
+};
+
+/// An extra layer for [`init_with`], erased so callers can pass a heterogeneous
+/// list. Produce one with `my_layer.with_filter(…).boxed()`.
+///
+/// It is typed against [`Registry`] rather than the composed subscriber because
+/// extra layers are installed directly onto the registry, beneath the fmt and
+/// OTLP layers — see [`init_with`].
+pub type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
 
 /// Stdout log rendering for the fmt layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,25 +109,87 @@ fn resolve_filter(directive: &str) -> EnvFilter {
     EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("info"))
 }
 
+/// The registry, the `extra` layers, and the filtered stdout layer — everything
+/// [`init_with`] composes before the optional OTLP layer goes on top.
+///
+/// Separated out so it can be exercised under
+/// [`tracing::subscriber::with_default`]. `init` installs a **global**
+/// subscriber, which a process may do exactly once, so a test that called it
+/// could never be joined by a second one; the interesting behaviour — which
+/// layer sees which event — is all here.
+///
+/// The return type spells out `LookupSpan` because per-layer filtering needs
+/// it: `Layer::with_filter` on the OTLP layer requires the subscriber beneath
+/// to be one whose spans can be looked up, and an opaque `impl Subscriber`
+/// loses that.
+fn stdout_subscriber(
+    cfg: &TelemetryConfig,
+    extra: Vec<BoxedLayer>,
+) -> impl tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync {
+    let fmt_layer = match cfg.log_format {
+        LogFormat::Json => fmt::layer().json().boxed(),
+        LogFormat::Compact => fmt::layer().compact().with_target(false).boxed(),
+        LogFormat::Default => fmt::layer().boxed(),
+    }
+    .with_filter(resolve_filter(&cfg.env_filter));
+
+    // `extra` goes on first because a `BoxedLayer` is typed against `Registry`:
+    // once fmt is layered on, the subscriber type is `Layered<_, Registry>` and
+    // no `Layer<Registry>` fits it. Order carries no filtering meaning here —
+    // every layer now decides for itself.
+    tracing_subscriber::registry().with(extra).with(fmt_layer)
+}
+
 /// Install the global subscriber per `cfg` and return a flush guard.
 ///
 /// Must be called once, early, inside a Tokio runtime (the OTLP batch exporter
 /// spawns on `runtime::Tokio`). Panics if a global subscriber is already set —
 /// matching fail-fast startup expectations of a binary's `main`.
 pub fn init(cfg: TelemetryConfig) -> TelemetryGuard {
-    let filter = resolve_filter(&cfg.env_filter);
+    init_with(cfg, Vec::new())
+}
 
-    let fmt_layer = match cfg.log_format {
-        LogFormat::Json => fmt::layer().json().boxed(),
-        LogFormat::Compact => fmt::layer().compact().with_target(false).boxed(),
-        LogFormat::Default => fmt::layer().boxed(),
-    };
+/// [`init`], plus `extra` layers that the caller's `env_filter` does not reach.
+///
+/// # Why the filter must not reach them
+///
+/// `env_filter` is what an operator sets `LOG_LEVEL` to, and it exists to
+/// decide **what gets printed**. Installed the obvious way — as a layer on the
+/// registry — it is not a printing decision at all: `Layered::enabled` is the
+/// conjunction of every layer's, so a directive of `info` discards the event
+/// for the whole subscriber and any layer added afterwards receives nothing.
+///
+/// That is fatal for a layer whose job is to *measure* rather than to print.
+/// `sqlx` emits one event per statement carrying its own `elapsed_secs`, at
+/// `DEBUG` — the level nobody runs a production API at — so a metrics layer
+/// reading those events under a global `info` filter records zero for ever, and
+/// looks exactly like a database that is never queried.
+///
+/// So the filter is applied **per layer**, to fmt and OTLP only, and `extra`
+/// layers carry their own. Install them with their filter already attached:
+///
+/// ```no_run
+/// # use tracing_subscriber::{filter::Targets, Layer};
+/// # use tracing::level_filters::LevelFilter;
+/// # fn make() -> bjorst_telemetry::BoxedLayer {
+/// # let my_layer = tracing_subscriber::fmt::layer();
+/// my_layer
+///     .with_filter(Targets::new().with_target("sqlx::query", LevelFilter::DEBUG))
+///     .boxed()
+/// # }
+/// ```
+///
+/// An unfiltered extra layer sees **every** event in the process, which is
+/// rarely what is wanted and raises the global max-level hint to `TRACE`.
+///
+/// Existing `init` callers are unaffected: with no extra layers, a per-layer
+/// filter on fmt (and on OTLP) admits and discards exactly what the global one
+/// did.
+pub fn init_with(cfg: TelemetryConfig, extra: Vec<BoxedLayer>) -> TelemetryGuard {
+    let base = stdout_subscriber(&cfg, extra);
 
     let Some(otlp) = cfg.otlp else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .init();
+        base.init();
         return TelemetryGuard { provider: None };
     };
 
@@ -130,10 +206,7 @@ pub fn init(cfg: TelemetryConfig) -> TelemetryGuard {
         Err(err) => {
             // Degrade to stdout-only rather than crashing the service if the
             // exporter cannot be constructed.
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(fmt_layer)
-                .init();
+            base.init();
             tracing::error!(error = %err, "OTLP exporter build failed; span export disabled");
             return TelemetryGuard { provider: None };
         }
@@ -149,13 +222,13 @@ pub fn init(cfg: TelemetryConfig) -> TelemetryGuard {
 
     opentelemetry::global::set_tracer_provider(provider.clone());
     let tracer = provider.tracer(cfg.service_name.clone());
-    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let otel_layer = tracing_opentelemetry::layer()
+        .with_tracer(tracer)
+        // A second parse of the same directive: `EnvFilter` is not `Clone`, and
+        // two layers cannot share one.
+        .with_filter(resolve_filter(&cfg.env_filter));
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt_layer)
-        .with(otel_layer)
-        .init();
+    base.with(otel_layer).init();
 
     TelemetryGuard {
         provider: Some(provider),
@@ -165,6 +238,114 @@ pub fn init(cfg: TelemetryConfig) -> TelemetryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::filter::Targets;
+
+    /// Records the target of every event it is shown. Stands in for a metrics
+    /// layer: the question is only ever whether the event arrives.
+    struct Probe(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Probe {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .expect("probe mutex")
+                .push(event.metadata().target().to_owned());
+        }
+    }
+
+    fn cfg_at(level: &str) -> TelemetryConfig {
+        TelemetryConfig {
+            service_name: "svc".into(),
+            env_filter: level.into(),
+            log_format: LogFormat::Compact,
+            otlp: None,
+        }
+    }
+
+    /// The whole reason `init_with` exists. `sqlx` reports every statement's
+    /// duration at DEBUG; an API runs at `info`. Under the old composition —
+    /// `EnvFilter` as a layer on the registry — this event reached nothing, and
+    /// a metrics layer subscribed to it recorded zero for ever while looking
+    /// perfectly healthy.
+    #[test]
+    fn an_extra_layer_sees_debug_events_the_env_filter_excludes() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe(Arc::clone(&seen))
+            .with_filter(Targets::new().with_target("sqlx::query", LevelFilter::DEBUG))
+            .boxed();
+
+        tracing::subscriber::with_default(
+            stdout_subscriber(&cfg_at("info"), vec![probe]),
+            || tracing::debug!(target: "sqlx::query", elapsed_secs = 0.5, "select 1"),
+        );
+
+        assert_eq!(
+            seen.lock().expect("probe mutex").as_slice(),
+            ["sqlx::query"]
+        );
+    }
+
+    /// The corollary: an extra layer is not handed the whole process. Its own
+    /// filter is the only thing narrowing it, so a filter that names one target
+    /// must exclude the rest — otherwise every `debug!` in every dependency
+    /// would be recorded as a query.
+    #[test]
+    fn an_extra_layers_own_filter_still_narrows_it() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe(Arc::clone(&seen))
+            .with_filter(Targets::new().with_target("sqlx::query", LevelFilter::DEBUG))
+            .boxed();
+
+        tracing::subscriber::with_default(stdout_subscriber(&cfg_at("info"), vec![probe]), || {
+            tracing::debug!(target: "hyper::client", "connecting");
+            tracing::error!(target: "some::other", "boom");
+        });
+
+        assert!(seen.lock().expect("probe mutex").is_empty());
+    }
+
+    /// The composition this change replaced, kept as a test so the reason is
+    /// not just a comment: with `EnvFilter` as a layer on the registry, the
+    /// identical probe under the identical directive receives nothing.
+    ///
+    /// Written the obvious way, `registry().with(filter).with(probe)` is what
+    /// anyone would reach for — which is exactly why it is worth pinning.
+    #[test]
+    fn a_global_env_filter_layer_starves_the_extra_layer() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe(Arc::clone(&seen))
+            .with_filter(Targets::new().with_target("sqlx::query", LevelFilter::DEBUG))
+            .boxed();
+
+        let old_composition = tracing_subscriber::registry()
+            .with(resolve_filter("info"))
+            .with(vec![probe]);
+
+        tracing::subscriber::with_default(old_composition, || {
+            tracing::debug!(target: "sqlx::query", elapsed_secs = 0.5, "select 1");
+        });
+
+        assert!(
+            seen.lock().expect("probe mutex").is_empty(),
+            "a global EnvFilter layer used to admit this event; the whole change is unnecessary"
+        );
+    }
+
+    /// `init` is `init_with` with nothing extra, and must compose to the same
+    /// thing it always did: no extra layer, so nothing outside the filter is
+    /// observed at all.
+    #[test]
+    fn no_extra_layers_composes_as_before() {
+        tracing::subscriber::with_default(stdout_subscriber(&cfg_at("info"), Vec::new()), || {
+            tracing::debug!(target: "sqlx::query", "select 1");
+        });
+    }
 
     #[test]
     fn valid_directive_is_used() {
