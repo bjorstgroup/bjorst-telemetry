@@ -34,9 +34,8 @@
 //! ```
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::{trace::TracerProvider, Resource};
+use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use tracing_subscriber::{
     fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer, Registry,
 };
@@ -93,13 +92,18 @@ pub struct TelemetryConfig {
 /// when `otlp` was `None` the drop is a no-op.
 #[must_use = "dropping the guard immediately shuts telemetry down"]
 pub struct TelemetryGuard {
-    provider: Option<TracerProvider>,
+    provider: Option<SdkTracerProvider>,
 }
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if self.provider.is_some() {
-            opentelemetry::global::shutdown_tracer_provider();
+        // Since opentelemetry 0.28 the provider is shut down by its owner, not
+        // through the global: this flushes the last batch and stops the
+        // exporter's thread.
+        if let Some(provider) = self.provider.take() {
+            if let Err(err) = provider.shutdown() {
+                eprintln!("telemetry shutdown: {err}");
+            }
         }
     }
 }
@@ -142,8 +146,9 @@ fn stdout_subscriber(
 
 /// Install the global subscriber per `cfg` and return a flush guard.
 ///
-/// Must be called once, early, inside a Tokio runtime (the OTLP batch exporter
-/// spawns on `runtime::Tokio`). Panics if a global subscriber is already set —
+/// Must be called once, early. The OTLP batch exporter runs on a thread of its
+/// own (opentelemetry 0.28+), with a blocking HTTP client, so no async runtime
+/// is required. Panics if a global subscriber is already set —
 /// matching fail-fast startup expectations of a binary's `main`.
 pub fn init(cfg: TelemetryConfig) -> TelemetryGuard {
     init_with(cfg, Vec::new())
@@ -212,12 +217,13 @@ pub fn init_with(cfg: TelemetryConfig, extra: Vec<BoxedLayer>) -> TelemetryGuard
         }
     };
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new(vec![KeyValue::new(
-            "service.name",
-            cfg.service_name.clone(),
-        )]))
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            Resource::builder()
+                .with_service_name(cfg.service_name.clone())
+                .build(),
+        )
         .build();
 
     opentelemetry::global::set_tracer_provider(provider.clone());
@@ -363,6 +369,31 @@ mod tests {
         let f = resolve_filter("app=definitely_not_a_level");
         let rendered = format!("{f}");
         assert_eq!(rendered, "info");
+    }
+
+    /// The OTLP path, as a service calls it: inside a Tokio runtime (`main` is
+    /// `#[tokio::main]`). Since opentelemetry 0.28 the batch exporter owns a
+    /// thread and a *blocking* HTTP client, and a blocking client built or
+    /// dropped on a runtime thread panics — so this installs the real global
+    /// subscriber with an exporter pointed at a closed port, emits a span, and
+    /// drops the guard, which flushes (failing to connect) and shuts down.
+    ///
+    /// It is the only test here that installs the global subscriber, which a
+    /// process may do once; the others use `with_default`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_initialises_and_shuts_down_inside_a_runtime() {
+        let guard = init(TelemetryConfig {
+            service_name: "svc".into(),
+            env_filter: "info".into(),
+            log_format: LogFormat::Compact,
+            otlp: Some(OtlpConfig {
+                endpoint: "http://127.0.0.1:9/v1/traces".into(),
+                headers: vec![("X-Test".into(), "1".into())],
+            }),
+        });
+        assert!(guard.provider.is_some(), "the exporter did not build");
+        tracing::info_span!("probe").in_scope(|| tracing::info!("inside"));
+        drop(guard);
     }
 
     #[test]
